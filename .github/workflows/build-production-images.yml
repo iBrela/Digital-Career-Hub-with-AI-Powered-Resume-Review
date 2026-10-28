@@ -1,0 +1,341 @@
+name: Production CI/CD
+
+on:
+  pull_request:
+    branches:
+      - staging
+      - main
+
+  push:
+    branches:
+      - main
+
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: production-pipeline-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate-images:
+    name: Validate Docker Images
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        application:
+          - name: backend
+            context: ./backend
+          - name: frontend
+            context: ./frontend
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Validate ${{ matrix.application.name }} image
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.application.context }}
+          push: false
+          cache-from: type=gha,scope=${{ matrix.application.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.application.name }}
+
+  publish-images:
+    name: Publish Production Images
+    if: >
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    environment: Production
+
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push backend image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./backend
+          push: true
+          tags: |
+            ghcr.io/ibrela/digital-career-hub-backend:${{ github.sha }}
+            ghcr.io/ibrela/digital-career-hub-backend:latest
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha,scope=backend
+          cache-to: type=gha,mode=max,scope=backend
+
+      - name: Build and push frontend image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./frontend
+          push: true
+          tags: |
+            ghcr.io/ibrela/digital-career-hub-frontend:${{ github.sha }}
+            ghcr.io/ibrela/digital-career-hub-frontend:latest
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          build-args: |
+            NEXT_PUBLIC_API_URL=${{ vars.PROD_API_URL }}
+            NEXT_PUBLIC_GOOGLE_CLIENT_ID=${{ vars.NEXT_PUBLIC_GOOGLE_CLIENT_ID }}
+            NEXT_PUBLIC_MICROSOFT_CLIENT_ID=${{ vars.NEXT_PUBLIC_MICROSOFT_CLIENT_ID }}
+            NEXT_PUBLIC_MICROSOFT_TENANT_ID=${{ vars.NEXT_PUBLIC_MICROSOFT_TENANT_ID }}
+          cache-from: type=gha,scope=frontend
+          cache-to: type=gha,mode=max,scope=frontend
+
+  deploy-production:
+    name: Deploy Production
+    needs:
+      - publish-images
+    if: >
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    environment: Production
+
+    permissions:
+      contents: read
+      packages: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure SSH
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
+        run: |
+          install -m 700 -d "${HOME}/.ssh"
+          printf '%s\n' "${SSH_PRIVATE_KEY}" > "${HOME}/.ssh/id_ed25519"
+          printf '%s\n' "${SSH_KNOWN_HOSTS}" > "${HOME}/.ssh/known_hosts"
+          chmod 600 "${HOME}/.ssh/id_ed25519"
+          chmod 600 "${HOME}/.ssh/known_hosts"
+          ssh-keygen -y -f "${HOME}/.ssh/id_ed25519" > /dev/null
+
+      - name: Prepare production configuration
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          JWT_SECRET: ${{ secrets.JWT_SECRET }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          AI_PROVIDER: ${{ vars.AI_PROVIDER }}
+          GEMINI_MODEL: ${{ vars.GEMINI_MODEL }}
+          PROD_FRONTEND_URL: ${{ vars.PROD_FRONTEND_URL }}
+          GOOGLE_CLIENT_ID: ${{ vars.NEXT_PUBLIC_GOOGLE_CLIENT_ID }}
+          MICROSOFT_CLIENT_ID: ${{ vars.NEXT_PUBLIC_MICROSOFT_CLIENT_ID }}
+          MICROSOFT_TENANT_ID: ${{ vars.NEXT_PUBLIC_MICROSOFT_TENANT_ID }}
+          BACKEND_PORT: ${{ vars.BACKEND_PORT }}
+          FRONTEND_PORT: ${{ vars.FRONTEND_PORT }}
+        run: |
+          umask 077
+          mkdir -p .deployment
+
+          cp docker-compose.production.yml .deployment/compose.yaml
+          cp deploy/deploy-production.sh .deployment/deploy-production.sh
+          cp deploy/rollback-production.sh .deployment/rollback-production.sh
+
+          {
+            printf 'NODE_ENV=production\n'
+            printf 'PORT=5001\n'
+            printf 'DATABASE_URL=%s\n' "${DATABASE_URL}"
+            printf 'JWT_SECRET=%s\n' "${JWT_SECRET}"
+            printf 'FRONTEND_URL=%s\n' "${PROD_FRONTEND_URL}"
+            printf 'GOOGLE_CLIENT_ID=%s\n' "${GOOGLE_CLIENT_ID}"
+            printf 'MICROSOFT_CLIENT_ID=%s\n' "${MICROSOFT_CLIENT_ID}"
+            printf 'MICROSOFT_TENANT_ID=%s\n' "${MICROSOFT_TENANT_ID}"
+            printf 'AI_PROVIDER=%s\n' "${AI_PROVIDER}"
+            printf 'GEMINI_API_KEY=%s\n' "${GEMINI_API_KEY}"
+            printf 'GEMINI_MODEL=%s\n' "${GEMINI_MODEL}"
+          } > .deployment/backend.env
+
+          {
+            printf 'BACKEND_IMAGE=ghcr.io/ibrela/digital-career-hub-backend:%s\n' "${GITHUB_SHA}"
+            printf 'FRONTEND_IMAGE=ghcr.io/ibrela/digital-career-hub-frontend:%s\n' "${GITHUB_SHA}"
+            printf 'BACKEND_ENV_FILE=./backend.env\n'
+            printf 'BACKEND_PORT=%s\n' "${BACKEND_PORT}"
+            printf 'FRONTEND_PORT=%s\n' "${FRONTEND_PORT}"
+          } > .deployment/release.env
+
+          chmod 600 .deployment/backend.env .deployment/release.env
+          chmod 700 \
+            .deployment/deploy-production.sh \
+            .deployment/rollback-production.sh
+
+      - name: Verify VPS SSH connection
+        env:
+          SSH_HOST: ${{ vars.SSH_HOST }}
+          SSH_PORT: ${{ vars.SSH_PORT }}
+          SSH_USER: ${{ vars.SSH_USER }}
+        run: |
+          ssh \
+            -p "${SSH_PORT}" \
+            -o BatchMode=yes \
+            -o StrictHostKeyChecking=yes \
+            "${SSH_USER}@${SSH_HOST}" \
+            "echo 'VPS SSH connection successful'"
+
+      - name: Upload release configuration
+        env:
+          SSH_HOST: ${{ vars.SSH_HOST }}
+          SSH_PORT: ${{ vars.SSH_PORT }}
+          SSH_USER: ${{ vars.SSH_USER }}
+          DEPLOY_PATH: ${{ vars.DEPLOY_PATH }}
+        run: |
+          RELEASE_ID="${GITHUB_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          REMOTE_RELEASE="${DEPLOY_PATH}/releases/${RELEASE_ID}"
+          SSH_TARGET="${SSH_USER}@${SSH_HOST}"
+
+          ssh \
+            -p "${SSH_PORT}" \
+            -o BatchMode=yes \
+            -o StrictHostKeyChecking=yes \
+            "${SSH_TARGET}" \
+            "mkdir -p '${REMOTE_RELEASE}' && chmod 700 '${REMOTE_RELEASE}'"
+
+          scp \
+            -P "${SSH_PORT}" \
+            -o BatchMode=yes \
+            -o StrictHostKeyChecking=yes \
+            .deployment/compose.yaml \
+            .deployment/backend.env \
+            .deployment/release.env \
+            .deployment/deploy-production.sh \
+            .deployment/rollback-production.sh \
+            "${SSH_TARGET}:${REMOTE_RELEASE}/"
+
+          ssh \
+            -p "${SSH_PORT}" \
+            -o BatchMode=yes \
+            -o StrictHostKeyChecking=yes \
+            "${SSH_TARGET}" \
+            "chmod 600 '${REMOTE_RELEASE}/backend.env' '${REMOTE_RELEASE}/release.env' \
+             && chmod 644 '${REMOTE_RELEASE}/compose.yaml' \
+             && chmod 700 '${REMOTE_RELEASE}/deploy-production.sh' '${REMOTE_RELEASE}/rollback-production.sh'"
+
+      - name: Log VPS in to GHCR
+        env:
+          SSH_HOST: ${{ vars.SSH_HOST }}
+          SSH_PORT: ${{ vars.SSH_PORT }}
+          SSH_USER: ${{ vars.SSH_USER }}
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          printf '%s' "${GHCR_TOKEN}" \
+            | ssh \
+                -p "${SSH_PORT}" \
+                -o BatchMode=yes \
+                -o StrictHostKeyChecking=yes \
+                "${SSH_USER}@${SSH_HOST}" \
+                "docker login ghcr.io --username '${GHCR_USER}' --password-stdin"
+
+      - name: Deploy immutable production release
+        env:
+          SSH_HOST: ${{ vars.SSH_HOST }}
+          SSH_PORT: ${{ vars.SSH_PORT }}
+          SSH_USER: ${{ vars.SSH_USER }}
+          DEPLOY_PATH: ${{ vars.DEPLOY_PATH }}
+        run: |
+          RELEASE_ID="${GITHUB_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          REMOTE_RELEASE="${DEPLOY_PATH}/releases/${RELEASE_ID}"
+
+          ssh \
+            -p "${SSH_PORT}" \
+            -o BatchMode=yes \
+            -o StrictHostKeyChecking=yes \
+            "${SSH_USER}@${SSH_HOST}" \
+            "DEPLOY_PATH='${DEPLOY_PATH}' RELEASE_SHA='${RELEASE_ID}' \
+             bash '${REMOTE_RELEASE}/deploy-production.sh'"
+
+      - name: Verify public production endpoints
+        id: public_health
+        continue-on-error: true
+        env:
+          PROD_API_URL: ${{ vars.PROD_API_URL }}
+          PROD_FRONTEND_URL: ${{ vars.PROD_FRONTEND_URL }}
+        run: |
+          curl \
+            --fail \
+            --silent \
+            --show-error \
+            --location \
+            --retry 12 \
+            --retry-delay 5 \
+            --retry-all-errors \
+            "${PROD_API_URL%/}/health" \
+            > /dev/null
+
+          curl \
+            --fail \
+            --silent \
+            --show-error \
+            --location \
+            --retry 12 \
+            --retry-delay 5 \
+            --retry-all-errors \
+            "${PROD_FRONTEND_URL%/}/" \
+            > /dev/null
+
+          echo "Production health checks passed."
+
+      - name: Roll back failed public deployment
+        if: steps.public_health.outcome == 'failure'
+        env:
+          SSH_HOST: ${{ vars.SSH_HOST }}
+          SSH_PORT: ${{ vars.SSH_PORT }}
+          SSH_USER: ${{ vars.SSH_USER }}
+          DEPLOY_PATH: ${{ vars.DEPLOY_PATH }}
+        run: |
+          RELEASE_ID="${GITHUB_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          REMOTE_RELEASE="${DEPLOY_PATH}/releases/${RELEASE_ID}"
+
+          ssh \
+            -p "${SSH_PORT}" \
+            -o BatchMode=yes \
+            -o StrictHostKeyChecking=yes \
+            "${SSH_USER}@${SSH_HOST}" \
+            "DEPLOY_PATH='${DEPLOY_PATH}' \
+             bash '${REMOTE_RELEASE}/rollback-production.sh'" \
+            || true
+
+          echo "::error::Production health checks failed. Rollback was attempted."
+          exit 1
+
+      - name: Log VPS out of GHCR
+        if: always()
+        continue-on-error: true
+        env:
+          SSH_HOST: ${{ vars.SSH_HOST }}
+          SSH_PORT: ${{ vars.SSH_PORT }}
+          SSH_USER: ${{ vars.SSH_USER }}
+        run: |
+          ssh \
+            -p "${SSH_PORT}" \
+            -o BatchMode=yes \
+            -o StrictHostKeyChecking=yes \
+            "${SSH_USER}@${SSH_HOST}" \
+            "docker logout ghcr.io"

@@ -42,3 +42,4 @@ build/
 # ========================
 .vscode/
 .idea/
+/deploy/compose.local.env
